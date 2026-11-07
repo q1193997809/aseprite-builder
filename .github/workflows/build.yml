@@ -1,135 +1,161 @@
-﻿name: Build Aseprite
+name: Build Aseprite (Windows 便携版)
+
+# 只产出一个便携版 zip：不含安装程序，不装 Inno Setup，失败点更少
+#
+# 已修正的上游问题：
+#   1. Skia 版本不再硬编码 m102，改为读取源码 laf/misc/skia-tag.txt（当前 m124-08a5439a6b）
+#   2. icudtl.dat 不再从已 404 的直链下载：Skia 包内自带，改为构建前断言
+#   3. CMake 固定 3.31.6（CMake 4.x 会因 third_party 中 <3.5 的声明直接报错）
+#   4. 写入 GITHUB_ENV 用 Add-Content -Encoding ascii，避免 BOM 污染变量名
+
 on:
   workflow_dispatch:
+    inputs:
+      aseprite_version:
+        description: 'Aseprite 版本 tag，例如 v1.3.18.6（留空 = 最新）'
+        required: false
+        default: ''
+
+env:
+  CMAKE_VERSION: '3.31.6'
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Enable Long Paths
+      - name: 启用长路径
         run: git config --system core.longpaths true
 
-      - name: Install Build Tools
-        run: choco install cmake ninja innosetup -y --no-progress
+      - name: 安装 Ninja
+        run: choco install ninja -y --no-progress
 
-      - name: Fetch Latest Release Metadata
+      - name: 安装固定版本 CMake
         shell: powershell
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $headers = @{}
-          if ($env:GH_TOKEN) { $headers["Authorization"] = "token $env:GH_TOKEN" }
-          $resp = (Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri https://api.github.com/repos/aseprite/aseprite/releases/latest -ErrorAction Stop).Content | ConvertFrom-Json
-          $asset = $resp.assets | Where-Object { $_.name -like "*Source.zip" } | Select-Object -First 1
-          if (-not $asset) {
-              $asset = $resp.assets | Select-Object -First 1
+          $ver = $env:CMAKE_VERSION
+          Invoke-WebRequest -Uri "https://github.com/Kitware/CMake/releases/download/v$ver/cmake-$ver-windows-x86_64.zip" -OutFile "cmake.zip" -UseBasicParsing
+          Expand-Archive -Force "cmake.zip" "C:\cmake"
+          $bin = "C:\cmake\cmake-$ver-windows-x86_64\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $bin -Encoding ascii
+          & "$bin\cmake.exe" --version
+
+      - name: 解析 Aseprite 版本
+        shell: powershell
+        run: |
+          $tag = "${{ github.event.inputs.aseprite_version }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+              $resp = Invoke-RestMethod -Uri "https://api.github.com/repos/aseprite/aseprite/releases/latest" -Headers @{ "User-Agent" = "aseprite-builder" }
+              $tag = $resp.tag_name
           }
-          echo "DOWNLOAD_URL=$($asset.browser_download_url)" >> $env:GITHUB_ENV
-          echo "ASE_VER=$($resp.tag_name)" >> $env:GITHUB_ENV
-          echo "Detected Aseprite version: $($resp.tag_name)"
-          echo "Source asset: $($asset.name)"
+          if (-not $tag.StartsWith("v")) { $tag = "v$tag" }
+          "ASE_TAG=$tag" | Add-Content -Path $env:GITHUB_ENV -Encoding ascii
+          Write-Host "目标版本: $tag"
 
-      - name: Download & Extract Source
+      - name: 下载并解压源码
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri ${{ env.DOWNLOAD_URL }} -OutFile "aseprite_src.zip" -UseBasicParsing
-          Expand-Archive -Force "aseprite_src.zip" "temp_ext"
-          $rootFile = Get-ChildItem -Path "temp_ext" -Filter "CMakeLists.txt" -Recurse | Select-Object -First 1
-          mkdir aseprite -Force
-          Get-ChildItem -Path "$($rootFile.Directory.FullName)\*" | Move-Item -Destination "aseprite" -Force
-          Write-Host "Source extracted successfully"
+          $url = "https://github.com/aseprite/aseprite/releases/download/$env:ASE_TAG/Aseprite-$env:ASE_TAG-Source.zip"
+          Write-Host "下载: $url"
+          Invoke-WebRequest -Uri $url -OutFile "src.zip" -UseBasicParsing
+          Expand-Archive -Force "src.zip" "temp_ext"
+          $root = Get-ChildItem -Path "temp_ext" -Recurse -Filter "CMakeLists.txt" | Select-Object -First 1
+          New-Item -ItemType Directory -Path "aseprite" -Force | Out-Null
+          Get-ChildItem -Path $root.Directory.FullName | Move-Item -Destination "aseprite" -Force
+          Write-Host "源码解压完成"
 
-      - name: Download & Extract Skia
+      - name: 下载并解压 Skia（版本取自源码）
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri "https://github.com/aseprite/skia/releases/download/m102-861e4743af/Skia-Windows-Release-x64.zip" -OutFile "skia.zip" -UseBasicParsing
-          mkdir skia -Force
+          $tag = (Get-Content "aseprite\laf\misc\skia-tag.txt" -Raw).Trim()
+          Write-Host "源码要求的 Skia tag: $tag"
+          Invoke-WebRequest -Uri "https://github.com/aseprite/skia/releases/download/$tag/Skia-Windows-Release-x64.zip" -OutFile "skia.zip" -UseBasicParsing
+          New-Item -ItemType Directory -Path "skia" -Force | Out-Null
           Expand-Archive -Force "skia.zip" "skia"
-          Write-Host "Skia extracted successfully"
+          "SKIA_TAG=$tag" | Add-Content -Path $env:GITHUB_ENV -Encoding ascii
 
-      - name: Initialize MSVC Environment
-        uses: ilammy/msvc-dev-cmd@v1
+          $icu = "skia\third_party\externals\icu\flutter\icudtl.dat"
+          if (-not (Test-Path $icu)) { throw "Skia 包 $tag 内缺少 icudtl.dat，skunicode 阶段必然失败" }
+          Write-Host "icudtl.dat 就位: $((Get-Item $icu).Length) 字节"
 
-      - name: Run CMake Configuration
+      - name: 检查脚本支持所需的 lua 子模块
         shell: powershell
         run: |
-          $abs_src = Join-Path $env:GITHUB_WORKSPACE "aseprite"
-          $abs_skia = Join-Path $env:GITHUB_WORKSPACE "skia"
-          $abs_build = Join-Path $env:GITHUB_WORKSPACE "build"
-          mkdir $abs_build -Force
-          Set-Location $abs_build
-          cmake -G Ninja `
+          if (Test-Path "aseprite\third_party\lua\lapi.c") {
+              "ASE_SCRIPTING=ON" | Add-Content -Path $env:GITHUB_ENV -Encoding ascii
+              Write-Host "lua 子模块存在，保留脚本支持"
+          } else {
+              "ASE_SCRIPTING=OFF" | Add-Content -Path $env:GITHUB_ENV -Encoding ascii
+              Write-Host "缺少 lua 子模块，关闭脚本支持"
+          }
+
+      - name: 初始化 MSVC 环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: CMake 配置
+        shell: powershell
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          cmake -S "$ws\aseprite" -B "$ws\build" -G Ninja `
             -DCMAKE_BUILD_TYPE=RelWithDebInfo `
             -DLAF_BACKEND=skia `
-            -DSKIA_DIR="$abs_skia" `
-            -DSKIA_LIBRARY_DIR="$abs_skia\out\Release-x64" `
-            -DSKIA_LIBRARY="$abs_skia\out\Release-x64\skia.lib" `
+            -DSKIA_DIR="$ws\skia" `
+            -DSKIA_LIBRARY_DIR="$ws\skia\out\Release-x64" `
+            -DSKIA_LIBRARY="$ws\skia\out\Release-x64\skia.lib" `
+            -DENABLE_SCRIPTING=$env:ASE_SCRIPTING `
             -DENABLE_UPDATER=OFF `
+            -DENABLE_NEWS=OFF `
             -DENABLE_TESTS=OFF `
-            "$abs_src"
-          Write-Host "CMake configuration completed"
+            -DENABLE_BENCHMARKS=OFF
+          if ($LASTEXITCODE -ne 0) { throw "CMake 配置失败" }
 
-      - name: Compile with Ninja
-        run: |
-          cd build
-          $cpuCount = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
-          $jobs = [math]::Min($cpuCount * 2, 8)
-          Write-Host "Using $jobs parallel compilation jobs"
-          ninja -j $jobs
-
-      - name: Collect Dependencies (DLLs)
+      - name: 编译
         shell: powershell
         run: |
-          $binDir = "$env:GITHUB_WORKSPACE\build\bin"
-          $sslDir = "C:\Program Files\OpenSSL\bin"
-          if (Test-Path "$sslDir\libcrypto-3-x64.dll") {
-              Copy-Item "$sslDir\libcrypto-3-x64.dll" -Destination $binDir -Force
-              Copy-Item "$sslDir\libssl-3-x64.dll" -Destination $binDir -Force
-              echo "[+] DLLs copied to $binDir"
-          } else {
-              echo "[!] OpenSSL DLLs not found - skipping"
+          ninja -C build -j 8
+          if ($LASTEXITCODE -ne 0) { throw "编译失败" }
+
+      - name: 打包便携版
+        shell: powershell
+        run: |
+          $bin = "$env:GITHUB_WORKSPACE\build\bin"
+          if (-not (Test-Path "$bin\aseprite.exe")) { throw "未生成 aseprite.exe" }
+          if (-not (Test-Path "$bin\icudtl.dat")) {
+              Copy-Item "$env:GITHUB_WORKSPACE\skia\third_party\externals\icu\flutter\icudtl.dat" "$bin\icudtl.dat"
+              Write-Host "构建产物缺少 icudtl.dat，已补入"
           }
+          "# 便携模式标记" | Out-File -FilePath "$bin\aseprite.ini" -Encoding ascii
 
-      - name: Package Installer (Inno Setup)
-        shell: powershell
-        run: |
-          $binPath = Join-Path $env:GITHUB_WORKSPACE "build\bin"
-          $iss = @"
-          [Setup]
-          AppName=Aseprite
-          AppVersion=${{ env.ASE_VER }}
-          DefaultDirName={autopf}\Aseprite
-          DefaultGroupName=Aseprite
-          OutputBaseFilename=aseprite-setup
-          OutputDir=installer
-          Compression=lzma
-          SolidCompression=yes
-          [Files]
-          Source: "$binPath\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-          [Icons]
-          Name: "{group}\Aseprite"; Filename: "{app}\aseprite.exe"
-          "@
-          mkdir installer -Force
-          $iss | Out-File -FilePath "aseprite.iss" -Encoding utf8
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" aseprite.iss
+          $out = "$env:GITHUB_WORKSPACE\Aseprite-$env:ASE_TAG-Windows-x64.zip"
+          Compress-Archive -Path "$bin\*" -DestinationPath $out -Force
+          Write-Host ("产物大小: {0:N1} MB" -f ((Get-Item $out).Length / 1MB))
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        if: success()
-        with:
-          tag_name: ${{ env.ASE_VER }}
-          name: Aseprite ${{ env.ASE_VER }}
-          files: installer/*.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Artifact
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: Aseprite-Installer
-          path: installer/*.exe
+          name: Aseprite-${{ env.ASE_TAG }}-Windows-x64
+          path: Aseprite-${{ env.ASE_TAG }}-Windows-x64.zip
+          retention-days: 7
+
+      - name: 发布 Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.ASE_TAG }}
+          name: Aseprite ${{ env.ASE_TAG }} (便携版)
+          body: |
+            Aseprite ${{ env.ASE_TAG }} 自编译便携版（Windows x64）
+            Skia: ${{ env.SKIA_TAG }}
+            解压即用，无需安装。
+
+            仅限个人使用，请勿转发或公开分发。请支持官方：https://www.aseprite.org/
+          files: Aseprite-${{ env.ASE_TAG }}-Windows-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
